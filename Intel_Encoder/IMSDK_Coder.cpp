@@ -12,10 +12,11 @@
 
 #include "IMSDK_Coder.h"
 #include "Util.h"
-#include "TaskPool.h"
 
 DeviceAndContext IMSDK_Coder::m_devcon;
 std::map<mfxHDL, AllocResponseCounted> IMSDK_Coder::AllocationResponses;
+
+using namespace Util;
 
 IMSDK_Coder::IMSDK_Coder()
 {
@@ -26,10 +27,210 @@ IMSDK_Coder::~IMSDK_Coder()
 {
 }
 
-void IMSDK_Coder::SetImplementation(const mfxIMPL impl, const mfxVersion ver)
+
+void IMSDK_Coder::InitializeCoder(bool use_video_memory, int pipeline_num, mfxIMPL impl, mfxVersion ver, std::vector<mfxVideoParam>& vpp_params, std::vector<mfxVideoParam>& enc_params)
 {
-    m_impl = impl;
-    m_ver = ver;
+    assert(pipeline_num > 0);
+    ClearCoder();
+
+    mfxStatus sts = MFX_ERR_NONE;
+
+    m_use_video_memory = use_video_memory;
+    m_pipelines.resize(pipeline_num);
+
+    // Initialize pipeline sessions
+    for (int i = 0; i < m_pipelines.size(); i++)
+    {
+        m_pipelines[i].InitSession(impl, ver);
+    }
+
+    // Join sessions
+    for (int i = 1; i < m_pipelines.size(); i++)
+    {
+        sts = m_pipelines[0].GetSession().JoinSession(m_pipelines[i].GetSession());
+        HandleMFXErrors(sts, "Joining Sessions");
+    }
+
+    // Initialize video memory acllocator
+    if (m_use_video_memory)
+    {
+        InitializeAllocator(m_pipelines[0].GetSession(), m_frame_allocator);
+        for (int i = 0; i < m_pipelines.size(); i++)
+        {
+            sts = m_pipelines[i].GetSession().SetHandle(MFX_HANDLE_D3D11_DEVICE, m_devcon.device);
+            HandleMFXErrors(sts, "Setting D3D11 device handle");
+            sts = m_pipelines[i].GetSession().SetFrameAllocator(&m_frame_allocator);
+            HandleMFXErrors(sts, "Setting frame allocator");
+        }
+    }
+
+    for (int i = 0; i < m_pipelines.size(); i++)
+    {
+        m_pipelines[i].InitBase(vpp_params[i], enc_params[i]);
+    }
+
+    // Calculate the number of surfaces needed
+    std::vector<mfxFrameAllocRequest> vpp_alloc_request(m_pipelines.size() * 2);
+    mfxFrameAllocRequest main_alloc_request;
+    for (int i = 0; i < m_pipelines.size(); i++)
+    {
+        sts = m_pipelines[i].GetVPP()->QueryIOSurf(&vpp_params[i], &vpp_alloc_request[i * 2]);
+        HandleMFXErrors(sts, "VPP surface number query");
+    }
+    main_alloc_request = vpp_alloc_request[0];
+
+    for (int i = 1; i < m_pipelines.size(); i++)
+        main_alloc_request.NumFrameSuggested += vpp_alloc_request[i * 2].NumFrameSuggested + vpp_params[0].AsyncDepth;
+
+    // Allocate surfaces
+    mfxU16 surf_num = 0;
+    if (use_video_memory)
+    {
+        m_frame_allocator.Alloc(m_frame_allocator.pthis, &main_alloc_request, &m_video_alloc_response);
+        surf_num = m_video_alloc_response.NumFrameActual;
+        m_surfaces.resize(surf_num);
+        for (int i = 0; i < m_surfaces.size(); i++)
+        {
+            m_surfaces[i].reset(new mfxFrameSurface1{ 0 });
+            m_surfaces[i]->Info = vpp_params[0].vpp.In;
+            m_surfaces[i]->Data.MemId = m_video_alloc_response.mids[i];
+        }
+    }
+    else
+    {
+        mfxU8 bits_per_pixel = 12;
+        mfxU16 surf_width = static_cast<mfxU16>(Util::RoundUp(vpp_alloc_request[0].Info.Width, 32));
+        mfxU16 surf_height = static_cast<mfxU16>(Util::RoundUp(vpp_alloc_request[0].Info.Height, 32));
+        mfxU32 surf_size = surf_width * surf_height * bits_per_pixel / 8;
+        m_surf_buffers.resize(surf_size * surf_num);
+
+        m_surfaces.resize(surf_num);
+        for (int i = 0; i < m_surfaces.size(); i++)
+        {
+            m_surfaces[i].reset(new mfxFrameSurface1{ 0 });
+            m_surfaces[i]->Info = vpp_params[0].vpp.In;
+            m_surfaces[i]->Data.Y = &m_surf_buffers[surf_size * i];
+            m_surfaces[i]->Data.U = m_surfaces[i]->Data.Y + surf_width * surf_height;
+            m_surfaces[i]->Data.V = m_surfaces[i]->Data.U + 1;
+            m_surfaces[i]->Data.Pitch = surf_width;
+        }
+    }
+
+    //Create task pools
+    m_task_pools.resize(m_pipelines.size());
+    for (int i = 0; i < m_pipelines.size(); i++)
+    {
+        mfxVideoParam tmp_param{ 0 };
+        sts = m_pipelines[i].GetEncode()->GetVideoParam(&tmp_param);
+        HandleMFXErrors(sts, "Getting encoder parameters");
+
+        m_task_pools[i].CreateTasks(enc_params[i].AsyncDepth, tmp_param.mfx.BufferSizeInKB * 1000);
+    }
+}
+
+void IMSDK_Coder::ClearCoder()
+{
+    // TODO
+}
+
+std::vector<std::vector<char>> IMSDK_Coder::EncodeFrame(const char* frame_data, int frame_data_pitch)
+{
+    std::vector<std::vector<char>> result (m_task_pools.size());
+    mfxStatus sts = MFX_ERR_NONE;
+    while (true)
+    {
+        std::vector<int> free_task_ind(m_task_pools.size());
+        bool can_proceed = true;
+        for (int i = 0; i < m_task_pools.size(); i++)
+        {
+            free_task_ind[i] = m_task_pools[i].GetFreeIndex();
+            if (free_task_ind[i] == -1) // if no free task is available - synchronise first task
+                                        // and write data to result vector
+            {
+                can_proceed = false;
+                auto& first_task = m_task_pools[i].GetFirstTask();
+                sts = m_pipelines[i].GetSession().SyncOperation(first_task.sync_point, SyncWaitTime);
+                HandleMFXErrors(sts, "Sync Operation");
+
+                result[i].insert(result[i].begin(),
+                              first_task.bitstream.Data + first_task.bitstream.DataOffset,
+                              first_task.bitstream.Data + first_task.bitstream.DataOffset + first_task.bitstream.DataLength);
+
+                first_task.bitstream.DataLength = 0;
+                first_task.sync_point = 0;
+                m_task_pools[i].IncrementFirst();
+            }
+        }
+        if (!can_proceed)
+            continue;
+        int in_surf_ind = FindFreeSurfaceIndex(m_surfaces, m_surfaces.size());
+        if (in_surf_ind == -1)
+            throw std::runtime_error("Can't find a free surface for input");
+
+        if (m_use_video_memory)
+        {
+            sts = m_frame_allocator.Lock(m_frame_allocator.pthis, m_surfaces[in_surf_ind]->Data.MemId, &(m_surfaces[in_surf_ind]->Data));
+            HandleMFXErrors(sts, "Locking frame");
+
+            LoadFrameToSurface(*(m_surfaces[in_surf_ind]), frame_data, frame_data_pitch);
+
+            sts = m_frame_allocator.Unlock(m_frame_allocator.pthis, m_surfaces[in_surf_ind]->Data.MemId, &(m_surfaces[in_surf_ind]->Data));
+            HandleMFXErrors(sts, "Unlocking frame");
+        }
+        else
+            LoadFrameToSurface(*(m_surfaces[in_surf_ind]), frame_data, frame_data_pitch);
+
+        for (int i = 0; i < m_pipelines.size(); i++)
+            m_pipelines[i].ProcessFrame(m_surfaces[in_surf_ind].get(), m_task_pools[i].GetTask(free_task_ind[i]));
+        return result;
+    }
+}
+
+std::vector<std::vector<std::vector<char>>> IMSDK_Coder::EncodeFinal()
+{
+    std::vector<std::vector<std::vector<char>>> result(m_task_pools.size());
+    mfxStatus sts = MFX_ERR_NONE;
+
+    std::vector<bool> buffer_empty(m_pipelines.size(), false);
+    int buffer_empty_num = 0; // number of pipelines that emptied their buffers fully
+
+    while (true)
+    {
+        if (buffer_empty_num >= m_pipelines.size())
+            break;
+        std::vector<int> free_task_ind(m_task_pools.size());
+        bool can_proceed = true;
+        for (int i = 0; i < m_task_pools.size(); i++)
+        {
+            free_task_ind[i] = m_task_pools[i].GetFreeIndex();
+            if (free_task_ind[i] == -1) // if no free task is available - synchronise first task
+                                        // and write data to result vector
+            {
+                can_proceed = false;
+                auto& first_task = m_task_pools[i].GetFirstTask();
+                sts = m_pipelines[i].GetSession().SyncOperation(first_task.sync_point, SyncWaitTime);
+                HandleMFXErrors(sts, "Sync Operation");
+
+                result[i].emplace_back(first_task.bitstream.Data + first_task.bitstream.DataOffset,
+                                        first_task.bitstream.Data + first_task.bitstream.DataOffset + first_task.bitstream.DataLength);
+
+                first_task.bitstream.DataLength = 0;
+                first_task.sync_point = 0;
+                m_task_pools[i].IncrementFirst();
+            }
+        }
+        if (!can_proceed)
+            continue;
+
+        for (int i = 0; i < m_pipelines.size(); i++)
+        {
+            if (buffer_empty[i])
+                continue;
+            buffer_empty[i] = m_pipelines[i].ProcessFrame(nullptr, m_task_pools[i].GetTask(free_task_ind[i]));
+            buffer_empty_num += buffer_empty[i];
+        }
+    }
+    return result;
 }
 
 void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std::string>& output_file_name)
@@ -48,7 +249,6 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
 
     mfxStatus sts = MFX_ERR_NONE;
 
-    mfxFrameAllocator frame_allocator;
     std::vector<MFXVideoSession> session(ParallelNum);
     mfxIMPL impl = MFX_IMPL_AUTO_ANY;
     mfxVersion ver = { {0, 1} };
@@ -60,6 +260,7 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
         HandleMFXErrors(sts, "Session initialization"); 
     }
 
+    mfxFrameAllocator frame_allocator;
     InitializeAllocator(session[0], frame_allocator);
 
     for (int i = 1; i < ParallelNum; i++)
@@ -179,8 +380,7 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
         vpp_out_enc_surf_num[i] = vpp_alloc_request[i*2 + 1].NumFrameSuggested + enc_alloc_request[i].NumFrameSuggested + AsyncDepth;
     }
 
-    mfxU8 bits_per_pixel = 12; // NV12 format is a 12 bits per pixel format
-
+    //mfxU8 bits_per_pixel = 12; // NV12 format is a 12 bits per pixel format
     //auto AllocateSurfaces = [](mfxFrameSurface1**& surfaces, const int surf_num, 
     //                           const mfxU16 width, const mfxU16 height, const int bits_per_pixel, 
     //                           const mfxFrameInfo& frame_info)
@@ -259,18 +459,7 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
         vpp_param[k].NumExtParam = 1;
     }
 
-    auto FindFreeSurfaceIndex = [](mfxFrameSurface1** surfaces, int size) -> int
-    {
-        for (int i = 0; i < size; i++)
-        {
-            if (!surfaces[i]->Data.Locked)
-                return i;
-        }
-        return -1;
-    };
-
     std::vector<TaskPool> task_pool(ParallelNum);
-
     for (int i = 0; i < ParallelNum; i++)
     {
         sts = vpp[i].Init(&vpp_param[i]);
@@ -325,7 +514,7 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
         sts = frame_allocator.Lock(frame_allocator.pthis, vpp_in_surfaces[in_surf_ind]->Data.MemId, &(vpp_in_surfaces[in_surf_ind]->Data));
         HandleMFXErrors(sts, "Locking frame");
 
-        bool input_available = LoadFrameToSurface(*(vpp_in_surfaces[in_surf_ind]), in_stream);
+        bool input_available = LoadFrameToSurfaceFromFile(*(vpp_in_surfaces[in_surf_ind]), in_stream);
         if (!input_available)
             break; // No input available means we reached the end of file. Go to the next stage.
 
@@ -556,16 +745,53 @@ void IMSDK_Coder::Test(const std::string& input_file_name, const std::vector<std
     frame_allocator.Free(frame_allocator.pthis, &alloc_response);
 }
 
-void IMSDK_Coder::HandleMFXErrors(const mfxStatus status, const std::string& where_str /* = "Unspecified operation" */)
+//int IMSDK_Coder::FindFreeSurfaceIndex(const std::vector<std::unique_ptr<mfxFrameSurface1>>& surfaces)
+//{
+//    for (int i = 0; i < surfaces.size(); i++)
+//    {
+//        if (!surfaces[i]->Data.Locked)
+//            return i;
+//    }
+//    return -1;
+//};
+
+//void IMSDK_Coder::HandleMFXErrors(const mfxStatus status, const std::string& where_str /* = "Unspecified operation" */)
+//{
+//    if (status < MFX_ERR_NONE)
+//    {
+//        std::cerr << "Error " << status << " during " << where_str << "\n";
+//        getchar();
+//    }
+//}
+
+
+void IMSDK_Coder::LoadFrameToSurface(mfxFrameSurface1& surface, const char* data, int data_pitch)
 {
-    if (status < MFX_ERR_NONE)
+    int width, height, pitch;
+    mfxU8* ptr;
+
+    if (surface.Info.CropW > 0 && surface.Info.CropH > 0)
     {
-        std::cerr << "Error " << status << " during " << where_str << "\n";
-        getchar();
+        width = surface.Info.CropW;
+        height = surface.Info.CropH;
+    }
+    else
+    {
+        width = surface.Info.Width;
+        height = surface.Info.Height;
+    }
+    pitch = surface.Data.Pitch;
+    ptr = (surface.Data.Y + surface.Info.CropY * pitch + surface.Info.CropX);
+
+    int total_height = height * 3 / 2;
+
+    for (int i = 0; i < total_height; i++)
+    {
+        memcpy(ptr + i * pitch, data + i * data_pitch, width);
     }
 }
 
-bool IMSDK_Coder::LoadFrameToSurface(mfxFrameSurface1& surface, std::fstream& in_stream)
+bool IMSDK_Coder::LoadFrameToSurfaceFromFile(mfxFrameSurface1& surface, std::fstream& in_stream)
 {
     // TODO Add real error handling
     auto& surf_info = surface.Info;
@@ -875,7 +1101,7 @@ mfxStatus IMSDK_Coder::VideoUnlock(mfxHDL, mfxMemId mid, mfxFrameData* frame)
     ID3D11Texture2D* surface = reinterpret_cast<ID3D11Texture2D*>(cmid->memid);
     ID3D11Texture2D* stage = reinterpret_cast<ID3D11Texture2D*>(cmid->stage_memid);
 
-    m_devcon.context->Unmap(surface, 0);
+    m_devcon.context->Unmap(stage, 0);
     m_devcon.context->CopySubresourceRegion(surface, 0, 0, 0, 0, stage, 0, NULL);
 
     if (frame)

@@ -13,6 +13,9 @@ private:
 public:
     TaskPool();
     ~TaskPool();
+    TaskPool(const TaskPool&) = delete;
+    TaskPool operator=(const TaskPool&) = delete;
+    TaskPool(TaskPool&&) = default;
 
     void CreateTasks(int num, size_t size);
     int GetFreeIndex();
@@ -22,7 +25,6 @@ public:
     void IncrementFirst();
 
 private:
-
     std::vector<Task> tasks;
     int first;
 };
@@ -39,4 +41,3 @@ struct Task
     Task(const Task&) = delete;
     Task(Task&& task) : bitstream(task.bitstream), sync_point(task.sync_point) { task.bitstream.Data = nullptr; }
 };
-
